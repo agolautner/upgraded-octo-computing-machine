@@ -1,0 +1,144 @@
+Sub ProcessCCSupervisorStatistics()
+    Dim sourcePath As String
+    Dim fileName As String
+    Dim sourceWorkbook As Workbook
+    Dim targetWorkbook As Workbook
+    Dim sourceSheet As Worksheet
+    Dim summarySheet As Worksheet
+    Dim outputRow As Long
+    Dim lastColumn As Integer
+    Dim fileCount As Integer
+    
+    ' Settings - MODIFY THESE!
+    sourcePath = "C:\fake\path\DAILY\15_01_24\" ' Trailing backslash required!
+    
+    ' Target workbook and summary sheet setup
+    Set targetWorkbook = ThisWorkbook
+    
+    ' Create new sheet for results (or use existing)
+    On Error Resume Next
+    Set summarySheet = targetWorkbook.Sheets("CCSupervisor_Summary")
+    If summarySheet Is Nothing Then
+        Set summarySheet = targetWorkbook.Sheets.Add
+        summarySheet.Name = "CCSupervisor_Summary"
+    End If
+    On Error GoTo 0
+    
+    ' Clear summary sheet and create header
+    summarySheet.Cells.Clear
+    summarySheet.Range("A1:G1").Value = Array("File Name", "Block", "Type", "Column Header", "Column", "Value", "Block Start Row")
+    summarySheet.Range("A1:G1").Font.Bold = True
+    
+    outputRow = 2
+    fileCount = 0
+    
+    ' Search for files
+    fileName = Dir(sourcePath & "*.xls*")
+    
+    If fileName = "" Then
+        MsgBox "No .xls files found in the specified folder: " & sourcePath, vbExclamation
+        Exit Sub
+    End If
+    
+    ' Process files
+    Do While fileName <> ""
+        Application.ScreenUpdating = False
+        Application.DisplayAlerts = False
+        
+        ' Open file
+        Set sourceWorkbook = Workbooks.Open(sourcePath & fileName, ReadOnly:=True)
+        Set sourceSheet = sourceWorkbook.Sheets(1) ' First sheet
+        
+        ' Determine last column (check from row 8)
+        lastColumn = sourceSheet.Cells(8, sourceSheet.Columns.Count).End(xlToLeft).Column
+        
+        ' Process blocks with correct row numbers
+        ' Block 1: Row 8 starts (data: 8-39, summaries: 40-43)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 1, 8, 39, 40, lastColumn, outputRow)
+        
+        ' Block 2: Row 52 starts (data: 52-83, summaries: 84-87)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 2, 52, 83, 84, lastColumn, outputRow)
+        
+        ' Block 3: Row 96 starts (data: 96-127, summaries: 128-131)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 3, 96, 127, 128, lastColumn, outputRow)
+        
+        ' Block 4: Row 140 starts (data: 140-171, summaries: 172-175)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 4, 140, 171, 172, lastColumn, outputRow)
+        
+        ' Block 5: Row 184 starts (data: 184-215, summaries: 216-219)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 5, 184, 215, 216, lastColumn, outputRow)
+        
+        ' Block 6: Row 228 starts (data: 228-259, summaries: 260-263)
+        Call ProcessBlock(sourceSheet, summarySheet, fileName, 6, 228, 259, 260, lastColumn, outputRow)
+        
+        ' Close file
+        sourceWorkbook.Close SaveChanges:=False
+        
+        fileCount = fileCount + 1
+        fileName = Dir() ' Next file
+    Loop
+    
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    
+    ' Auto-fit columns
+    summarySheet.Columns("A:G").AutoFit
+    
+    MsgBox "Processing complete! " & vbCrLf & _
+           "Files processed: " & fileCount & vbCrLf & _
+           "Results are in the 'CCSupervisor_Summary' sheet.", vbInformation
+End Sub
+
+' Helper procedure to process one block
+Sub ProcessBlock(sourceSheet As Worksheet, summarySheet As Worksheet, _
+                 fileName As String, blockNumber As Integer, _
+                 startRow As Long, endRow As Long, summaryStartRow As Long, _
+                 lastColumn As Integer, ByRef outputRow As Long)
+    
+    Dim col As Integer
+    Dim summaryTypes As Variant
+    Dim i As Integer
+    Dim headerRow As Long
+    Dim hasData As Boolean
+    
+    summaryTypes = Array("Sum", "Average", "Maximum", "Minimum")
+    
+    ' Header row is typically 1 row above the block start
+    headerRow = startRow - 1
+    
+    ' Check if block has any data (check if at least one cell in the data range has content)
+    hasData = False
+    For col = 2 To lastColumn ' Check from column B onwards
+        If Not IsEmpty(sourceSheet.Cells(startRow, col).Value) Then
+            hasData = True
+            Exit For
+        End If
+    Next col
+    
+    ' Process summary rows (40-43, 84-87, 128-131, etc.)
+    ' These should be processed even if data rows are sparse
+    For i = 0 To 3 ' 4 summary rows (Sum, Average, Maximum, Minimum)
+        For col = 3 To lastColumn ' From column C (3) to the last
+            ' Only process if the cell has a value
+            If Not IsEmpty(sourceSheet.Cells(summaryStartRow + i, col).Value) Then
+                summarySheet.Cells(outputRow, 1).Value = fileName
+                summarySheet.Cells(outputRow, 2).Value = "Block " & blockNumber
+                summarySheet.Cells(outputRow, 3).Value = summaryTypes(i)
+                
+                ' Column header (from the row before block start)
+                summarySheet.Cells(outputRow, 4).Value = sourceSheet.Cells(headerRow, col).Value
+                
+                ' Column letter
+                summarySheet.Cells(outputRow, 5).Value = Split(sourceSheet.Cells(1, col).Address, "$")(1)
+                
+                ' Value from summary row
+                summarySheet.Cells(outputRow, 6).Value = sourceSheet.Cells(summaryStartRow + i, col).Value
+                
+                ' Block start row (for reference)
+                summarySheet.Cells(outputRow, 7).Value = startRow
+                
+                outputRow = outputRow + 1
+            End If
+        Next col
+    Next i
+End Sub
