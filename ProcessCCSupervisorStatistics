@@ -334,6 +334,323 @@ End Function
 
 Option Explicit
 
+Private Const SRC_SHEET         As String  = "General"
+Private Const SHEET_PREFIX      As String  = "FP_"   ' prefix for imported sheets
+Private Const BLOCK_COUNT       As Integer = 6
+Private Const BLOCK_HEIGHT      As Integer = 44
+Private Const HEADER_OFFSET     As Integer = 6
+Private Const DATA_START_OFFSET As Integer = 7
+Private Const DATA_ROW_COUNT    As Integer = 32
+Private Const TOTAL_COLS        As Integer = 252
+
+' -----------------------------------------------------------------------
+' Entry point
+' -----------------------------------------------------------------------
+Sub ImportFormPilFiles()
+    Dim sFolder As String
+    Dim sFile   As String
+    Dim wbSrc   As Workbook
+    Dim wbDst   As Workbook
+    Dim wsNew   As Worksheet
+
+    With Application.FileDialog(msoFileDialogFolderPicker)
+        .Title = "Select folder containing FormPil files"
+        If .Show <> -1 Then Exit Sub
+        sFolder = .SelectedItems(1)
+    End With
+    If Right(sFolder, 1) <> "\" Then sFolder = sFolder & "\"
+
+    Set wbDst = ThisWorkbook
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+
+    ' Remove previously imported sheets (identified by prefix) and old Summary
+    Dim ws As Worksheet
+    Dim toDelete() As String
+    Dim delCount As Integer
+    delCount = 0
+    ReDim toDelete(0)
+
+    For Each ws In wbDst.Worksheets
+        If ws.Name = "Summary" Or Left(ws.Name, Len(SHEET_PREFIX)) = SHEET_PREFIX Then
+            delCount = delCount + 1
+            ReDim Preserve toDelete(delCount - 1)
+            toDelete(delCount - 1) = ws.Name
+        End If
+    Next ws
+
+    Dim k As Integer
+    For k = 0 To delCount - 1
+        wbDst.Sheets(toDelete(k)).Delete
+    Next k
+
+    ' Process each .xlsm in the folder
+    Dim sheetNames() As String
+    Dim sheetCount   As Integer
+    sheetCount = 0
+    ReDim sheetNames(0)
+
+    sFile = Dir(sFolder & "*.xlsm")
+    Do While sFile <> ""
+        If LCase(sFile) <> LCase(wbDst.Name) Then
+            Set wbSrc = Workbooks.Open(sFolder & sFile, ReadOnly:=True, UpdateLinks:=False)
+            Set wsNew = ImportOneFile(wbSrc, wbDst, sFile)
+            wbSrc.Close SaveChanges:=False
+
+            If Not wsNew Is Nothing Then
+                sheetCount = sheetCount + 1
+                ReDim Preserve sheetNames(sheetCount - 1)
+                sheetNames(sheetCount - 1) = wsNew.Name
+            End If
+        End If
+        sFile = Dir()
+    Loop
+
+    If sheetCount > 0 Then
+        BuildSummary wbDst, sheetNames, sheetCount
+    Else
+        MsgBox "No FormPil files found in the selected folder.", vbInformation
+    End If
+
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    MsgBox "Done! Imported " & sheetCount & " file(s).", vbInformation
+End Sub
+
+' -----------------------------------------------------------------------
+' Reads wbSrc's General sheet, flattens all 6 blocks into a flat table,
+' writes it to a new sheet in wbDst.
+' Sheet name = SHEET_PREFIX + filename without extension (max 31 chars).
+' Col A = time interval; remaining cols follow source cols 3+.
+' Returns the created worksheet, or Nothing on error.
+' -----------------------------------------------------------------------
+Private Function ImportOneFile(wbSrc As Workbook, wbDst As Workbook, _
+                               sFileName As String) As Worksheet
+    On Error GoTo ErrHandler
+
+    If Not SheetExists(wbSrc, SRC_SHEET) Then
+        Set ImportOneFile = Nothing
+        Exit Function
+    End If
+
+    Dim wsSrc As Worksheet
+    Set wsSrc = wbSrc.Sheets(SRC_SHEET)
+
+    Dim shName As String
+    shName = Left(SHEET_PREFIX & StripExtension(sFileName), 31)
+
+    Dim wsNew As Worksheet
+    Set wsNew = wbDst.Sheets.Add(After:=wbDst.Sheets(wbDst.Sheets.Count))
+    wsNew.Name = shName
+
+    ' --- Write header row -------------------------------------------
+    Dim headerSrcRow As Integer
+    headerSrcRow = 1 + HEADER_OFFSET  ' row 7
+
+    wsNew.Cells(1, 1).Value = "Időszak"
+    Dim c As Integer
+    For c = 3 To TOTAL_COLS
+        Dim hv As Variant
+        hv = wsSrc.Cells(headerSrcRow, c).Value
+        If Not IsEmpty(hv) And hv <> "" Then
+            wsNew.Cells(1, c - 1).Value = hv
+        End If
+    Next c
+
+    ' --- Copy data rows from all 6 blocks ---------------------------
+    Dim dstRow As Long
+    dstRow = 2
+
+    Dim blk As Integer
+    For blk = 0 To BLOCK_COUNT - 1
+        Dim blkStart As Integer
+        blkStart = 1 + blk * BLOCK_HEIGHT
+
+        Dim dataStart As Integer
+        dataStart = blkStart + DATA_START_OFFSET
+
+        Dim r As Integer
+        For r = dataStart To dataStart + DATA_ROW_COUNT - 1
+            Dim timeVal As Variant
+            timeVal = wsSrc.Cells(r, 2).Value
+            If Not IsEmpty(timeVal) And timeVal <> "" Then
+                wsNew.Cells(dstRow, 1).Value = timeVal
+                Dim c2 As Integer
+                For c2 = 3 To TOTAL_COLS
+                    wsNew.Cells(dstRow, c2 - 1).Value = wsSrc.Cells(r, c2).Value
+                Next c2
+                dstRow = dstRow + 1
+            End If
+        Next r
+    Next blk
+
+    Set ImportOneFile = wsNew
+    Exit Function
+
+ErrHandler:
+    MsgBox "Error importing " & sFileName & ": " & Err.Description, vbExclamation
+    Set ImportOneFile = Nothing
+End Function
+
+' -----------------------------------------------------------------------
+' Builds a Summary sheet: one row per unique time interval,
+' each numeric column summed across all imported sheets.
+' -----------------------------------------------------------------------
+Private Sub BuildSummary(wbDst As Workbook, sheetNames() As String, sheetCount As Integer)
+    Dim wsSumm As Worksheet
+    Set wsSumm = wbDst.Sheets.Add(Before:=wbDst.Sheets(1))
+    wsSumm.Name = "Summary"
+
+    Dim wsRef As Worksheet
+    Set wsRef = wbDst.Sheets(sheetNames(0))
+
+    Dim lastCol As Long
+    lastCol = wsRef.Cells(1, wsRef.Columns.Count).End(xlToLeft).Column
+
+    ' Copy header row from reference sheet
+    Dim c As Long
+    For c = 1 To lastCol
+        wsSumm.Cells(1, c).Value = wsRef.Cells(1, c).Value
+    Next c
+
+    ' Collect unique time intervals
+    Dim col As New Collection
+    Dim s As Integer
+    Dim ws As Worksheet
+    Dim r As Long
+    On Error Resume Next
+    For s = 0 To sheetCount - 1
+        Set ws = wbDst.Sheets(sheetNames(s))
+        Dim lastRow As Long
+        lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+        For r = 2 To lastRow
+            Dim tv As Variant
+            tv = ws.Cells(r, 1).Value
+            If Not IsEmpty(tv) And tv <> "" Then
+                col.Add CStr(tv), CStr(tv)
+            End If
+        Next r
+    Next s
+    On Error GoTo 0
+
+    If col.Count = 0 Then Exit Sub
+
+    Dim n As Long
+    n = col.Count
+    Dim arr() As String
+    ReDim arr(n - 1)
+    Dim i As Long
+    For i = 0 To n - 1
+        arr(i) = col(i + 1)
+    Next i
+    SortByStartTime arr, n
+
+    ' Write summary rows
+    Dim dstRow As Long
+    dstRow = 2
+    For i = 0 To n - 1
+        Dim slot As String
+        slot = arr(i)
+        wsSumm.Cells(dstRow, 1).Value = slot
+
+        For c = 2 To lastCol
+            Dim total As Double
+            total = 0
+            Dim hasData As Boolean
+            hasData = False
+            For s = 0 To sheetCount - 1
+                Set ws = wbDst.Sheets(sheetNames(s))
+                lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+                For r = 2 To lastRow
+                    If CStr(ws.Cells(r, 1).Value) = slot Then
+                        Dim v As Variant
+                        v = ws.Cells(r, c).Value
+                        If IsNumeric(v) And Not IsEmpty(v) Then
+                            total = total + CDbl(v)
+                            hasData = True
+                        End If
+                        Exit For
+                    End If
+                Next r
+            Next s
+            If hasData Then wsSumm.Cells(dstRow, c).Value = total
+        Next c
+
+        dstRow = dstRow + 1
+    Next i
+End Sub
+
+' -----------------------------------------------------------------------
+' Sort array of time-interval strings by start time (ascending)
+' -----------------------------------------------------------------------
+Private Sub SortByStartTime(arr() As String, n As Long)
+    Dim i As Long, j As Long
+    Dim tmp As String
+    For i = 1 To n - 1
+        tmp = arr(i)
+        j = i - 1
+        Do While j >= 0 And StartMinutes(arr(j)) > StartMinutes(tmp)
+            arr(j + 1) = arr(j)
+            j = j - 1
+        Loop
+        arr(j + 1) = tmp
+    Next i
+End Sub
+
+Private Function StartMinutes(s As String) As Long
+    Dim dashPos As Integer
+    dashPos = InStr(s, "-")
+    Dim startPart As String
+    If dashPos > 0 Then
+        startPart = Trim(Left(s, dashPos - 1))
+    Else
+        startPart = Trim(s)
+    End If
+    Dim colonPos As Integer
+    colonPos = InStr(startPart, ":")
+    If colonPos > 0 Then
+        StartMinutes = CLng(Left(startPart, colonPos - 1)) * 60 + _
+                       CLng(Mid(startPart, colonPos + 1))
+    Else
+        StartMinutes = 0
+    End If
+End Function
+
+' -----------------------------------------------------------------------
+' Helpers
+' -----------------------------------------------------------------------
+Private Function SheetExists(wb As Workbook, sName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(sName)
+    SheetExists = Not ws Is Nothing
+    On Error GoTo 0
+End Function
+
+Private Function StripExtension(s As String) As String
+    Dim pos As Integer
+    pos = InStrRev(s, ".")
+    If pos > 0 Then StripExtension = Left(s, pos - 1) Else StripExtension = s
+End Function
+' =============================================================
+' ImportFormPil - Macro to import FormPil .xlsm files
+'
+' Each source file covers one day. Its General sheet has 6 blocks
+' of 44 rows each (starting at rows 1, 45, 89, 133, 177, 221).
+' Within each block:
+'   block_start + 6  : column header row
+'   block_start + 7  : first of 32 data rows  (col B = time interval)
+'   block_start + 38 : last data row
+'   block_start + 39..+42 : Összeg/Átlag/Maximum/Minimum  (skipped)
+'
+' One sheet is created per source file, named after the filename.
+' Each row = one time interval; col A = time interval string.
+' A Summary sheet sums every numeric column by time interval
+' across all imported sheets, sorted chronologically.
+' =============================================================
+
+Option Explicit
+
 Private Const SRC_SHEET        As String  = "General"
 Private Const BLOCK_COUNT      As Integer = 6
 Private Const BLOCK_HEIGHT     As Integer = 44
